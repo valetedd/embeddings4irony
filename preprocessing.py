@@ -15,7 +15,6 @@ def txt_to_csv(f, delete_old=True):
 
         with open(f, "r", newline="", encoding="utf-8") as txt_file:
             lines = csv.reader(txt_file, delimiter="\t")
-
             with open(csv_path, "w", newline="", encoding="utf-8") as csv_file:
                 writer = csv.writer(csv_file, delimiter=",")
                 for line in lines:
@@ -39,8 +38,8 @@ def clean_text(item: str):
 
 def main():
 
-    TRAIN_PATH = "data/train/"
-    for f in Path(TRAIN_PATH).iterdir():
+    PATH = "data/test/"
+    for f in Path(PATH).iterdir():
         path = txt_to_csv(f, delete_old=True)
         df = pd.read_csv(path)
         print(df.columns, "\n", df.head())
@@ -48,7 +47,7 @@ def main():
 
         if "emoji" not in f.name:
             df["Tweet text"] = df["Tweet text"].apply(
-                lambda x: emoji.replace_emoji(x, "")
+                lambda x: emoji.demojize(x, ("::", "::"))
             )
 
 
