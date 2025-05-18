@@ -7,6 +7,18 @@ import emoji
 import pandas as pd
 
 
+def clean_text(item: str):
+
+    item = emoji.demojize(item, ("::", "::"))
+
+    tag_pattern = r"@\w{1,15}"
+    link_pattern = r"http[s]?://\S+"
+
+    data = re.sub(pattern=tag_pattern, repl="<USER>", string=item)
+    data = re.sub(pattern=link_pattern, repl="<URL>", string=data)
+    return data.strip()
+
+
 def txt_to_csv(f, delete_old=True):
 
     csv_path = f.with_suffix(".csv")
@@ -26,29 +38,14 @@ def txt_to_csv(f, delete_old=True):
     return csv_path
 
 
-def clean_text(item: str):
-
-    tag_pattern = r"@\w{1,15}"
-    link_pattern = r"http[s]?://\S+"
-
-    data = re.sub(pattern=tag_pattern, repl="<USER>", string=item)
-    data = re.sub(pattern=link_pattern, repl="<URL>", string=data)
-    return data.strip()
-
-
 def main():
 
     PATH = "data/test/"
     for f in Path(PATH).iterdir():
         path = txt_to_csv(f, delete_old=True)
-        df = pd.read_csv(path)
-        print(df.columns, "\n", df.head())
+        df = pd.read_csv(path, delimiter=",", quotechar='"')
         df["Tweet text"] = df["Tweet text"].apply(clean_text)
-
-        if "emoji" not in f.name:
-            df["Tweet text"] = df["Tweet text"].apply(
-                lambda x: emoji.demojize(x, ("::", "::"))
-            )
+        print(df.columns, "\n", df.head())
 
 
 if __name__ == "__main__":

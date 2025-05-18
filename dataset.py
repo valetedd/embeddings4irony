@@ -26,6 +26,7 @@ class IronyDetectionDataset(Dataset):
     ):
 
         data["Tweet text"] = data["Tweet text"].apply(clean_text)
+        data.to_csv("./data.csv")
         self.data = data["Tweet text"].to_list()
         self.labels = [float(lab) for lab in data["Label"].to_list()]
 
@@ -35,7 +36,7 @@ class IronyDetectionDataset(Dataset):
     def __getitem__(self, idx):
 
         text = self.data[idx]
-        label = torch.tensor(self.labels[idx], dtype=torch.float32).unsqueeze(dim=0)
+        label = self.labels[idx]
         return text, label
 
 
@@ -46,12 +47,15 @@ class EmbeddingCollate:
         embedding_model: Literal[
             "instructor", "bert-cls", "bert-avg", "sonar"
         ] = "bert-cls",
+        multiclass: bool = False,
         device: str = "cpu",
     ):
         self.emb_model = embedding_model
         self.device = torch.device(device)
         self.tokenizer = None
         self.model = None
+        self.multiclass = multiclass
+        self.tensor_type = torch.long if multiclass else torch.float32
 
         # Initialize tokenizer and model based on embedding_model
         print(f"Initializing embedding model {self.emb_model} on device {self.device}")
@@ -81,7 +85,7 @@ class EmbeddingCollate:
 
             case _:
                 raise ValueError(
-                    "Invalid embedding model. Please choose one among 'instructor', 'bert-cls', 'bert-avg', 'sonar'."
+                    f"Invalid embedding model ({self.emb_model}). Please choose one among 'instructor', 'bert-cls', 'bert-avg', 'sonar'."
                 )
 
     def __call__(self, batch: tuple[List[str]]):
@@ -89,16 +93,22 @@ class EmbeddingCollate:
         Collate function that takes a batch of (text, label) tuples,
         embeds the text, and returns a batch of (embedding, label) tensors.
         """
-
         texts = [item[0] for item in batch]
         labels = [item[1] for item in batch]
 
         embeddings = self._embed_batch(texts)
-        labels_tensor = torch.tensor(labels, dtype=torch.float32).unsqueeze(dim=1)
+
+        if self.multiclass:
+            labels_tensor = torch.tensor(labels, dtype=torch.long)
+        else:
+            labels_tensor = torch.tensor(labels, dtype=torch.float32).unsqueeze(dim=1)
+
+        if labels_tensor.size(0) == 1 or embeddings.size(0) == 1:
+            print("WARNING: batch size was unadvertently set to 1")
 
         return embeddings, labels_tensor
 
-    def _embed_batch(self, texts: List[str]):
+    def _embed_batch(self, texts: List[str]) -> torch.Tensor:
         """Helper method to perform embedding for a batch of texts."""
 
         with torch.no_grad():
@@ -157,7 +167,7 @@ class EmbeddingCollate:
                         "Invalid embedding model."
                     )  # Should not happen if initialized correctly
 
-        return embeddings
+        return embeddings.to(dtype=self.tensor_type)
 
 
 def test():
@@ -168,9 +178,7 @@ def test():
     print(len(df))
 
     for model in MODELS:
-        ds = IronyDetectionDataset(
-            df, embedding_model=model, device=DEVICE  # pyright:ignore
-        )
+        ds = IronyDetectionDataset(df)
         collate_fn = EmbeddingCollate(
             embedding_model=model, device=DEVICE  # pyright:ignore
         )  # pyright:ignore
