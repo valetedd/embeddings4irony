@@ -26,7 +26,6 @@ class IronyDetectionDataset(Dataset):
     ):
 
         data["Tweet text"] = data["Tweet text"].apply(clean_text)
-        data.to_csv("./data.csv")
         self.data = data["Tweet text"].to_list()
         self.labels = [float(lab) for lab in data["Label"].to_list()]
 

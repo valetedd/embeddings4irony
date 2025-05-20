@@ -10,9 +10,43 @@ import pandas as pd
 def clean_text(item: str):
 
     item = emoji.demojize(item, ("::", "::"))
-
+    blacklist = [
+        "#the",
+        "#a",
+        "#is",
+        "#to",
+        "#on",
+        "#you",
+        "#be",
+        "#it",
+        "#for",
+        "#me",
+        "#and",
+        "#this",
+        "#my",
+        "#i",
+        "#im",
+        "#are",
+        "#was",
+        "#how",
+        "#we",
+        "#in",
+        "#of",
+        "#why",
+        "#our",
+        "#or",
+        "#he",
+    ]
     tag_pattern = r"@\w{1,15}"
     link_pattern = r"http[s]?://\S+"
+    hashtag_pattern = r"#\w+"
+
+    # Filtering hashtags based on blacklist
+    hashtags = re.findall(pattern=hashtag_pattern, string=item)
+    if hashtags:
+        for h in hashtags:
+            if h in blacklist:
+                item = re.sub(pattern=hashtag_pattern, repl="<HASHTAG>", string=item)
 
     data = re.sub(pattern=tag_pattern, repl="<USER>", string=item)
     data = re.sub(pattern=link_pattern, repl="<URL>", string=data)
@@ -40,8 +74,9 @@ def txt_to_csv(f, delete_old=True):
 
 def main():
 
-    PATH = "data/test/"
+    PATH = "data/train/"
     for f in Path(PATH).iterdir():
+        print(f)
         path = txt_to_csv(f, delete_old=True)
         df = pd.read_csv(path, delimiter=",", quotechar='"')
         df["Tweet text"] = df["Tweet text"].apply(clean_text)

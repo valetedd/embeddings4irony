@@ -7,16 +7,17 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader, random_split
 
 from dataset import EmbeddingCollate, IronyDetectionDataset
-from models import TaskAClassifier
+from explore import count_labels
+from model import IronyClassifier
 
 try:
     torch.cuda.manual_seed(42)
 except:
     print("CUDA not connected")
+import json
 import os
 from copy import deepcopy
 from datetime import datetime
-from pathlib import Path
 
 from sklearn.metrics import accuracy_score, classification_report, f1_score
 from tqdm import tqdm
@@ -40,7 +41,9 @@ def train(
     predictions = []
     targets = []
 
-    for data, label in tqdm( dataloader, desc="Training progress" , disable=__name__ != "__main__"):
+    for data, label in tqdm(
+        dataloader, desc="Training progress", disable=__name__ != "__main__"
+    ):
         data = data.to(device)
         label = label.to(device)
 
@@ -113,7 +116,9 @@ def eval(
     predictions = []
     targets = []
 
-    for data, label in tqdm( val_dataloader, desc="Training progress" , disable=__name__ != "__main__"):        
+    for data, label in tqdm(
+        val_dataloader, desc="Training progress", disable=__name__ != "__main__"
+    ):
         data = data.to(device)
         label = label.to(device)
 
@@ -126,7 +131,6 @@ def eval(
             logits = model(data)
             loss = criterion(logits, label)
 
-        
         if multiclass:
             prob_preds = torch.softmax(logits, dim=1)
             preds = torch.argmax(prob_preds, dim=1)
@@ -161,10 +165,20 @@ def eval(
     }
 
 
-def run_test_data(model, path, device, collate, multiclass=False, batch_size=32):
+def run_test_data(model, path, device, collate=None, emb_model=None, multiclass=False, batch_size=32):
 
+    if not collate and not emb_model:
+        raise TypeError("either pass a collate function or pass and embedding model name")
     df = pd.read_csv(path)
     dataset = IronyDetectionDataset(df)
+    if not collate:
+
+        collate = EmbeddingCollate(
+            embedding_model=emb_model,
+            multiclass=multiclass,
+            device=device,
+        )
+
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -179,74 +193,35 @@ def run_test_data(model, path, device, collate, multiclass=False, batch_size=32)
     for data, label in tqdm(dataloader, desc="Test progress:"):
         data = data.to(device)
         label = label.to(device)
-        all_labels.extend(label.detach().cpu().numpy())
+        all_labels.append(label)
 
         with torch.no_grad():
             logits = model(data)
+
             if not multiclass:
                 preds = torch.round(torch.sigmoid(logits))
             else:
-                preds = torch.argmax(torch.softmax(logits, dim=1))
-            all_preds.extend(preds.cpu().numpy())
+                preds = torch.argmax(torch.softmax(logits, dim=1), dim=1)
+            all_preds.append(preds)
 
+    all_preds, all_labels = torch.cat(all_preds).cpu().detach().numpy(), torch.cat(all_labels).cpu().detach().numpy()
     accuracy = accuracy_score(all_labels, all_preds)
     avg = "binary" if not multiclass else "weighted"
-    f1 = f1_score(all_labels, all_preds, zero_division=0)
+    f1 = f1_score(all_labels, all_preds, average=avg, zero_division=0)
 
     print("\n", "=" * 10, " TEST ", "=" * 10, "\n")
 
+    print(classification_report(
+        y_true=all_labels,
+        y_pred=all_preds,
+        zero_division=0
+    ))
     print(f"Test accuracy |  {accuracy:.2f}%")
-    print(f"Test F1: {f1:.2f}") 
+    print(f"Test F1: {f1:.2f}")
 
     return accuracy, f1
 
 
-def kfold_cv(config, k=5):
-    """
-    Function to perform k-fold cross validation.
-    """
-
-    from sklearn.model_selection import KFold
-
-    df = pd.read_csv("./data/train/SemEval2018-T3-train-taskA_emoji.csv")
-    data = IronyDetectionDataset(df)
-    best_result = {}
-    # Creating a dir for current cv sessione
-    timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M")
-    path = Path(f"./cv/cv_{timestamp}")
-    os.makedirs(path)
-
-    kf = KFold(n_splits=k, shuffle=True, random_state=42)
-    for fold, (train_idx, val_idx) in enumerate(kf.split(data)):
-        # Creating subsets
-        train_subset = torch.utils.data.Subset(data, train_idx)
-        val_subset = torch.utils.data.Subset(data, val_idx)
-        print(f"Starting fold n.{fold}")
-        # Running training session
-        checkpoint = run_session(
-            config=config,
-            multiclass=config["MULTI"],
-            traind_path="./data/train/SemEval2018-T3-train-taskA_emoji.csv",
-            testd_path="./data/test/SemEval2018-T3_gold_test_taskA_emoji.csv",
-            splits={
-                "train": train_subset,
-                "val": val_subset,
-            },
-        )
-        if checkpoint is None:
-            raise ValueError("Failed to retrive checkpoint")
-
-        print(f"\n\nFinished fold {fold} with the following configuration:\n{config}")
-
-        if best_result and checkpoint["avg_f1"] < best_result["avg_f1"]:
-            continue
-
-        best_result = checkpoint
-        best_result["train"] = train_subset
-        best_result["val"] = val_subset
-
-    torch.save(best_result, path / "best_result.pt")
-    return best_result
 
 
 def run_session(
@@ -261,13 +236,18 @@ def run_session(
     Running a training session.
     """
 
+    if not traind_path and splits:
+        raise TypeError("No data passed through 'traind_path' or 'splits' parameters.")
+
     DEVICE_NAME = "cuda" if torch.cuda.is_available() else "cpu"
-    TRAIN_SPLIT = config["SPLIT"]
+    TRAIN_SPLIT = 0.8
+    if not splits:
+        TRAIN_SPLIT = config["SPLIT"]
 
     LR = config["LR"]
     REDUCED_DIM = config["REDUX"]
     H_DIM = config["H_DIM"]
-    EPOCHS = config["EPOCHS"]
+    EPOCHS = config["MAX_EPOCHS"]
     BATCH_SIZE = config["BATCH_SIZE"]
     DROP_RATE = config["DROP_RATE"]
     L1 = config["L1"]
@@ -324,7 +304,9 @@ def run_session(
     # Setting up dataloaders
     workers = 0 if DEVICE_NAME == "cuda" else 8
 
-    collate_func = EmbeddingCollate(embedding_model=EMB_MODEL, multiclass=config["MULTI"], device=DEVICE_NAME)
+    collate_func = EmbeddingCollate(
+        embedding_model=EMB_MODEL, multiclass=config["MULTI"], device=DEVICE_NAME
+    )
 
     train_dataloader = DataLoader(
         train_dataset,
@@ -346,15 +328,15 @@ def run_session(
 
     # Initializing model
     print("Model input dim: ", input_shape)
-    model = TaskAClassifier(
+    model = IronyClassifier(
         emb_dim=input_shape,  # pyright:ignore
-        h_dim=H_DIM,
-        drop_rate=DROP_RATE,
+        h_dim=H_DIM, drop_rate=DROP_RATE,
         n_classes=1 if not config["MULTI"] else 4,
         use_learnable_dr=REDUCED_DIM is not None,
         reduced_dim=REDUCED_DIM,
-        use_attention=config["USE_ATT"],
     )
+
+
     model.to(DEVICE_NAME)
 
     scaler = torch.GradScaler("cuda", enabled=(DEVICE_NAME == "cuda"))
@@ -362,7 +344,14 @@ def run_session(
     if not config["MULTI"]:
         loss_fn = torch.nn.BCEWithLogitsLoss()
     else:
-        loss_fn = torch.nn.CrossEntropyLoss()
+        train_labels = [full_dataset.labels[i] for i in train_dataset.indices]
+
+        label_series = pd.Series(train_labels)
+        label_counts = label_series.value_counts().sort_index().to_numpy()        
+        weights = 1.0 / label_counts # inverse frequency
+        weights = weights / weights.sum()  # Normalize
+        weights_tensor = torch.FloatTensor(weights).to(DEVICE_NAME)
+        loss_fn = torch.nn.CrossEntropyLoss(weight=weights_tensor)
 
     if config["OPT"] == "SGD":
         optim = torch.optim.SGD(
@@ -377,21 +366,15 @@ def run_session(
             weight_decay=WEIGHT_DECAY,
         )
 
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer=optim,
-        T_max=EPOCHS,
-        eta_min=1e-6,
-    )
-
     plat_scheduler = ReduceLROnPlateau(
         optimizer=optim,
-        mode="min",
+        mode="max",
         patience=PATIENCE,
         factor=0.1,
     )
 
-    # Variables used in early stopping
-    best_loss = 0.0
+    # Variables used in early stopping (based on f1 performance)
+    best_f1 = -1.0
     tolerance = max(3, PATIENCE)
     best_model = None
     all_f1 = 0.0
@@ -405,7 +388,7 @@ def run_session(
             print("#" * 10, f" EPOCH: {epoch+1} ", "#" * 10, "\n")
 
             train_result = train(
-                multiclass=True if config["MULTI"] else False,
+                multiclass=config["MULTI"],
                 dataloader=train_dataloader,
                 model=model,
                 criterion=loss_fn,
@@ -423,33 +406,31 @@ def run_session(
             )
 
             val_result = eval(
-                multiclass=True if config["MULTI"] else False,
+                multiclass=config["MULTI"],
                 val_dataloader=val_dataloader,
                 model=model,
                 criterion=loss_fn,
                 device=DEVICE_NAME,
             )
-            val_loss = val_result["loss"]
+            val_f1 = val_result["f1"]
             print("\n", "*" * 10, "VALIDATION METRICS", "*" * 10)
             print()
             print(val_result["report"])
             print(
-                f"Validation loss | {val_loss:.5f}\nValidation Accuracy | {val_result["accuracy"]:.2f}%"
+                f"Validation loss | {val_result["loss"]:.5f}\nValidation Accuracy | {val_result["accuracy"]:.2f}%"
             )
             all_f1 += val_result["f1"]
             all_acc += val_result["accuracy"]
             last_epoch = epoch + 1
 
-            if epoch >= EPOCHS // 2:
-                plat_scheduler.step(val_loss)
-            else:
-                scheduler.step()
+            # LR scheduling
+            plat_scheduler.step(val_f1)
 
             if not early_stop:
                 continue
 
             # Early stopping
-            if epoch != 0 and val_loss > best_loss:
+            if epoch != 0 and val_f1 < best_f1:
 
                 tolerance -= 1
 
@@ -462,7 +443,7 @@ def run_session(
             # Reset tolerance and save best result
             tolerance = max(3, PATIENCE)
 
-            best_loss = val_loss
+            best_f1 = val_f1
             best_model = deepcopy(model.state_dict())
 
     except KeyboardInterrupt:
@@ -478,48 +459,56 @@ def run_session(
             "config": config,
             "avg_acc": all_acc / last_epoch,
             "avg_f1": all_f1 / last_epoch,
+            "last_epoch": last_epoch
         }
 
         torch.save(
             checkpoint,
-            os.path.join("best_model.pt"),
+            os.path.join(session_path, "best_model.pt"),
         )
 
     if run_test == True:
-        run_test_data(
+        test_acc, test_f1 = run_test_data(
             model=model,
             path=testd_path,
             device=DEVICE_NAME,
             collate=collate_func,
             batch_size=BATCH_SIZE,
+            multiclass=config["MULTI"]
         )
+        with open(os.path.join(session_path, "test_metrics.pt"), mode="w", encoding="utf-8") as json_f:
+            json.dump({
+                "test_acc": test_acc,
+                "test_f1": test_f1,
+                "last_epoch": last_epoch,
+            }, json_f)
+
     return checkpoint
 
 
 if __name__ == "__main__":
 
     config = {
-        "EMB_MODEL": "sonar",
+        "MULTI": True,
+        "EMB_MODEL": "bert-cls",
+        "OPT": "AdamW",
+
         "SEED": 42,
         "SPLIT": 0.8,
         "LR": 1e-4,
         "REDUX": 256,
         "H_DIM": 64,
-        "EPOCHS": 30,
+        "MAX_EPOCHS": 5,
         "BATCH_SIZE": 32,
         "DROP_RATE": 0.4,
         "L1": 1e-5,
         "WEIGHT_DECAY": 1e-4,
         "PATIENCE": 3,  # how much stagnating epochs to tolerate
-        "USE_ATT": True,
-        "OPT": "AdamW",
-
-        "MULTI": False
     }
 
     check = run_session(
         config,
-        traind_path="./data/train/SemEval2018-T3-train-taskA_emoji.csv",
-        testd_path="./data/test/SemEval2018-T3_gold_test_taskA_emoji.csv",
+        traind_path="./data/train/SemEval2018-T3-train-taskB_emoji.csv",
+        testd_path="./data/test/SemEval2018-T3_gold_test_taskB_emoji.csv",
         run_test=True,
     )

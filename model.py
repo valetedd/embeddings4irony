@@ -24,7 +24,7 @@ class AttentionLayer(nn.Module):
         return context_vector, attention_weights
 
 
-class TaskAClassifier(nn.Module):
+class IronyClassifier(nn.Module):
 
     def __init__(
         self,

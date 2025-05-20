@@ -1,3 +1,6 @@
 .venv/
-backup_dataset.py
 __pycache__
+models
+results
+data
+cv

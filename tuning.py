@@ -6,21 +6,23 @@ from functools import partial
 
 import numpy as np
 import pandas as pd
+import ray
 import ray.tune as tune
 import torch
+from hyperopt import hp
 from ray.tune import Checkpoint, get_checkpoint
 from ray.tune.schedulers import ASHAScheduler
+from ray.tune.search.hyperopt import HyperOptSearch
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader, random_split
 
 from dataset import EmbeddingCollate, IronyDetectionDataset
-from models import TaskAClassifier
-from training import eval, run_test_data, train
+from model import IronyClassifier
+from training import eval, train
 
 
 def objective(
     config: dict,
-    data_path: str,
     emb_model: str = "bert-cls",
 ):
 
@@ -29,7 +31,7 @@ def objective(
 
     # Loading data from csv
     base_dir = os.path.abspath(os.path.dirname(__file__))
-    train_data_path = os.path.join(base_dir, data_path)
+    train_data_path = os.path.join(base_dir, config["PATH"])
     data_df = pd.read_csv(train_data_path)
 
     # Instantiating dataset
@@ -68,14 +70,13 @@ def objective(
 
     # Initializing model
     print("Model input dim: ", input_shape)
-    model = TaskAClassifier(
+    model = IronyClassifier(
         emb_dim=input_shape,
         h_dim=config["H_DIM"],
         use_learnable_dr=True if config["REDUX"] else False,
         reduced_dim=config["REDUX"],
         n_classes=1 if not config["MULTI"] else 4,
         drop_rate=config["DROP_RATE"],
-        use_attention=config["ATT"],
     )
     model.to(DEVICE_NAME)
 
@@ -85,7 +86,15 @@ def objective(
     if not config["MULTI"]:
         loss_fn = torch.nn.BCEWithLogitsLoss()
     else:
-        loss_fn = torch.nn.CrossEntropyLoss()
+
+        train_labels = [full_dataset.labels[i] for i in train_dataset.indices]
+        label_series = pd.Series(train_labels)
+        label_counts = label_series.value_counts().sort_index().to_numpy()
+
+        weights = 1.0 / label_counts  # inverse frequency
+        weights = weights / weights.sum()  # Normalize
+        weights_tensor = torch.FloatTensor(weights).to(DEVICE_NAME)
+        loss_fn = torch.nn.CrossEntropyLoss(weight=weights_tensor)
 
     if config["OPT"] == "SGD":
         optim = torch.optim.SGD(
@@ -99,14 +108,10 @@ def objective(
             lr=config["LR"],
             weight_decay=config["WEIGHT_DECAY"],
         )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer=optim,
-        T_max=config["MAX_EPOCHS"],
-        eta_min=1e-6,
-    )
+
     plat_scheduler = ReduceLROnPlateau(
         optimizer=optim,
-        mode="min",
+        mode="max",
         patience=config["PATIENCE"],
     )
 
@@ -119,8 +124,7 @@ def objective(
             model.load_state_dict(checkpoint_data["model_state"])
             optim.load_state_dict(checkpoint_data["optimizer_state"])
             scaler.load_state_dict(checkpoint_data["scaler_state"])
-
-    best_f1 = 0.0
+    best_f1 = -1.0
     for epoch in range(config["MAX_EPOCHS"]):
         _ = train(
             multiclass=config["MULTI"],
@@ -130,7 +134,7 @@ def objective(
             optimizer=optim,
             device=DEVICE_NAME,
             scaler=scaler,
-            l1_coeff=config["L1_LAMBDA"],
+            l1_coeff=config["L1"],
         )
 
         val_result = eval(
@@ -141,12 +145,8 @@ def objective(
             device=DEVICE_NAME,
         )
 
-        if epoch < config["MAX_EPOCHS"] // 2:
-            scheduler.step()
-        else:
-            plat_scheduler.step(val_result["loss"])
-
-        if val_result["f1"] > best_f1 or epoch == 0:
+        plat_scheduler.step(val_result["f1"])
+        if val_result["f1"] > best_f1:
             best_f1 = val_result["f1"]
             with tempfile.TemporaryDirectory() as checkpoint_dir:
                 path = os.path.join(checkpoint_dir, "checkpoint.pt")
@@ -167,46 +167,62 @@ def objective(
                     },
                     checkpoint=checkpoint,
                 )
-
         else:
             tune.report(
                 {
                     "l": val_result["loss"],
                     "f1": val_result["f1"],
-                }
+                },
             )
 
     print("Finished!")
 
 
-def tune_downstream_model(config, embedding_model, num_samples=10):
+def tune_downstream_model(
+    config, embedding_model, trainable=objective, bayesian=True, num_samples=10
+):
 
     timestamp = datetime.now().strftime("%H_%M")
 
+    static_params = config["STATIC"]
     scheduler = ASHAScheduler(
-        time_attr="time_iteration",
-        max_t=config["MAX_EPOCHS"],
-        grace_period=config["MAX_EPOCHS"] // 2,
+        max_t=static_params["MAX_EPOCHS"],
+        grace_period=5,
         reduction_factor=2,
+        metric="f1",
+        mode="max",
     )
+    if bayesian:
+        searcher = HyperOptSearch(space=config["HYPEROPT"], metric="f1", mode="max")
+        params = {**static_params}
+    else:
+        searcher = None
+        params = {**config["TUNE"], **static_params}
+
+    # Remove the environment variable
+    if "AIR_VERBOSITY" in os.environ:
+        print("Reset air verbosity")
+        del os.environ["AIR_VERBOSITY"]
+
+    if ray.is_initialized():
+        ray.shutdown()
+    ray.init()
 
     tuner = tune.Tuner(
         tune.with_resources(
-            partial(objective, emb_model=embedding_model, data_path=config["PATH"]),
+            partial(trainable, emb_model=embedding_model),
             resources={"cpu": 8, "gpu": 1},
         ),
         tune_config=tune.TuneConfig(
-            metric="f1",
-            mode="max",
             scheduler=scheduler,
+            search_alg=searcher,
             num_samples=num_samples,
             trial_name_creator=lambda trial: trial.trial_id[-4:],
             trial_dirname_creator=lambda trial: trial.trial_id,
-            reuse_actors=True,
         ),
-        param_space=config,
+        param_space=params,
         run_config=tune.RunConfig(
-            # name=f"{embedding_model}_exp_{timestamp}",
+            name=f"{embedding_model}_exp_{timestamp}",
             progress_reporter=tune.CLIReporter(
                 metric_columns=["l", "f1"],
                 max_column_length=5,
@@ -218,7 +234,7 @@ def tune_downstream_model(config, embedding_model, num_samples=10):
     )
 
     # Setting seeds for reproducibility
-    SEED = 42
+    SEED = static_params.get("SEED", 42)
     torch.manual_seed(SEED)
     np.random.seed(SEED)
     random.seed(SEED)
@@ -230,30 +246,26 @@ def tune_downstream_model(config, embedding_model, num_samples=10):
     # Running tuning optimization
     result = tuner.fit()
 
-    # Getting top-5 trials metrics
+    # Getting top-5 trials metrics&config
     os.makedirs("results", exist_ok=True)
     result_df = result.get_dataframe(filter_metric="f1", filter_mode="max").sort_values(
         by=["f1"]
     )
     result_df.head().to_csv(
-        f"./results/results_{embedding_model}_{timestamp}.csv"
+        f"./results/trials_df_{embedding_model}_{timestamp}.csv"  # saving as csv for plotting or further analysis
     )  # storing as csv
     best_trial = result.get_best_result("f1", "max")
 
-    if (
-        best_trial.config is None
-        or best_trial.metrics is None
-        or best_trial.checkpoint is None
-    ):
+    if best_trial.config is None or best_trial.metrics is None:
         raise AttributeError(
             "Best trial has unexpected 'None' attributes (.config, .metrics or .checkpoint). Print them for debugging"
         )
 
     print(f"Best trial config: {best_trial.config}")
     print(f"Best trial final validation loss: {best_trial.metrics['l']}")
-    print(f"Best trial final validation accuracy: {best_trial.metrics['f1']}")
+    print(f"Best trial final validation f1-score: {best_trial.metrics['f1']}")
 
-    return best_trial.checkpoint
+    return best_trial
 
 
 if __name__ == "__main__":
@@ -261,20 +273,37 @@ if __name__ == "__main__":
     MODEL = "instructor"
 
     config = {
-        "PATH": "./data/train/SemEval2018-T3-train-taskB_emoji.csv",
-        "MULTI": True,  # wether to perform binary or multiclass classification
-        "OPT": "AdamW",  # tune.choice(["SGD", "ADAM"]),
+        "STATIC": {
+            "PATH": "./data/train/SemEval2018-T3-train-taskB_emoji.csv",
+            "MULTI": True,  # wether to perform binary or multiclass classification
+            "OPT": "AdamW",  # tune.choice(["SGD", "ADAM"]),
+            "MAX_EPOCHS": 20,
+            "SAMPLES": 10,
+            "SEED": 42,
+        },
+        "HYPEROPT": {
+            "REDUX": hp.choice("REDUX", [None, 128, 256, 512]),
+            "H_DIM": hp.choice("H_DIM", [8, 16, 32, 64, 128]),
+            "LR": hp.loguniform("LR", np.log(2e-5), np.log(5e-3)),
+            "WEIGHT_DECAY": hp.loguniform("WEIGHT_DECAY", np.log(1e-5), np.log(5e-1)),
+            "L1": hp.loguniform("L1", np.log(1e-6), np.log(5e-4)),
+            "DROP_RATE": hp.choice("DROP_RATE", [0.2, 0.3, 0.4, 0.5]),
+            "BATCH_SIZE": hp.choice("BATCH_SIZE", [8, 16, 32, 64]),
+            "PATIENCE": hp.randint("PATIENCE", 4) + 2,  # rand int in [2, 6)
+        },
         # HYPERPARAMS
-        "REDUX": tune.choice([None, 128, 256, 512]),
-        "H_DIM": tune.choice([2**i for i in range(3, 8)]),
-        "LR": tune.loguniform(2e-5, 5e-3),
-        "WEIGHT_DECAY": tune.loguniform(1e-5, 5e-1),
-        "L1_LAMBDA": tune.loguniform(1e-6, 5e-4),
-        "DROP_RATE": tune.choice([0.2, 0.3, 0.4, 0.5]),
-        "BATCH_SIZE": tune.choice([8, 16, 32, 64]),
-        "PATIENCE": tune.randint(2, 6),
-        "MAX_EPOCHS": 2,
-        "ATT": tune.choice([True, False]),
+        "TUNE": {
+            "REDUX": tune.choice([None, 128, 256, 512]),
+            "H_DIM": tune.choice([2**i for i in range(3, 8)]),
+            "LR": tune.loguniform(2e-5, 5e-3),
+            "WEIGHT_DECAY": tune.loguniform(1e-5, 5e-1),
+            "L1": tune.loguniform(1e-6, 5e-4),
+            "DROP_RATE": tune.choice([0.2, 0.3, 0.4, 0.5]),
+            "BATCH_SIZE": tune.choice([8, 16, 32, 64]),
+            "PATIENCE": tune.randint(2, 6),
+        },
     }
 
-    tune_downstream_model(config, embedding_model=MODEL, num_samples=2)
+    tune_downstream_model(
+        config, embedding_model=MODEL, num_samples=config["STATIC"]["SAMPLES"]
+    )
