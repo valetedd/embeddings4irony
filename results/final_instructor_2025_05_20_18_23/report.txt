@@ -1,0 +1,18 @@
+ ==========  TEST  ==========
+
+              precision    recall  f1-score   support
+
+         0.0       0.85      0.71      0.77       473
+         1.0       0.65      0.81      0.72       311
+
+    accuracy                           0.75       784
+   macro avg       0.75      0.76      0.75       784
+weighted avg       0.77      0.75      0.75       784
+
+Test accuracy |  0.75%
+Test F1: 0.72
+FINISHED!
+
+Cross-validation completed!
+Best F1 score: 0.6865597752132919 (fold 5)
+Mean F1: 0.6687 ± 0.0145
